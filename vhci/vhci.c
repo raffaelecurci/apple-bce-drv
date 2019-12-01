@@ -4,6 +4,7 @@
 #include <linux/usb.h>
 #include <linux/usb/hcd.h>
 #include <linux/module.h>
+#include <linux/version.h>
 
 static dev_t bce_vhci_chrdev;
 static struct class *bce_vhci_class;
@@ -46,6 +47,9 @@ int bce_vhci_create(struct bce_device *dev, struct bce_vhci *vhci)
         goto fail_hcd;
     }
     vhci->hcd->self.sysdev = &dev->pci->dev;
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,4,0)
+    vhci->hcd->self.uses_dma = 1;
+#endif
     *((struct bce_vhci **) vhci->hcd->hcd_priv) = vhci;
     vhci->hcd->speed = HCD_USB2;
 
@@ -695,7 +699,11 @@ static const struct hc_driver bce_vhci_driver = {
         .product_desc = "BCE VHCI Host Controller",
         .hcd_priv_size = sizeof(struct bce_vhci *),
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,4,0)
+        .flags = HCD_USB2,
+#else
         .flags = HCD_USB2 | HCD_DMA,
+#endif
 
         .start = bce_vhci_start,
         .stop = bce_vhci_stop,
