@@ -3,6 +3,7 @@
 #include "vhci.h"
 #include "../apple_bce.h"
 #include <linux/usb/hcd.h>
+#include "../utils/helpers.h"
 
 static void bce_vhci_transfer_queue_completion(struct bce_queue_sq *sq);
 static void bce_vhci_transfer_queue_giveback(struct bce_vhci_transfer_queue *q);
@@ -400,6 +401,7 @@ int bce_vhci_urb_request_cancel(struct bce_vhci_transfer_queue *q, struct urb *u
     struct bce_vhci_urb *vurb;
     unsigned long flags;
     int ret;
+    
 
     spin_lock_irqsave(&q->urb_lock, flags);
     if ((ret = usb_hcd_check_unlink_urb(q->vhci->hcd, urb, status))) {
@@ -408,6 +410,7 @@ int bce_vhci_urb_request_cancel(struct bce_vhci_transfer_queue *q, struct urb *u
     }
 
     vurb = urb->hcpriv;
+    bool allow_vurb_free = true;
     /* If the URB wasn't posted to the device yet, we can still remove it on the host without pausing the queue. */
     if (vurb->state != BCE_VHCI_URB_INIT_PENDING) {
         pr_debug("bce-vhci: [%02x] Cancelling URB\n", q->endp_addr);
@@ -419,16 +422,198 @@ int bce_vhci_urb_request_cancel(struct bce_vhci_transfer_queue *q, struct urb *u
         ++q->remaining_active_requests;
     }
 
-    usb_hcd_unlink_urb_from_ep(q->vhci->hcd, urb);
+    //usb_hcd_unlink_urb_from_ep is not always safe     
+    
+    // pr_info("\tHCD");
+    // print_hcd(q->vhci->hcd);
+    // pr_info("\tURB");
+    // print_urb(urb,"transfer.c");
+    pr_info("\n\n");
+    print_ep_from_urb(urb);
+    //pr_info("endpoint to be unlinked: %u",get_ep_from_urb(urb));
 
-    spin_unlock_irqrestore(&q->urb_lock, flags);
+    if(urb->hcpriv != NULL){ //vurb->state != 3 && 
+        print_state(vurb,q,urb,status,ret);
+        pr_info("ALL GOOD URB CAN BE SAFELY UNLINKED");
+        usb_hcd_unlink_urb_from_ep(q->vhci->hcd, urb);
+        spin_unlock_irqrestore(&q->urb_lock, flags);
+        usb_hcd_giveback_urb(q->vhci->hcd, urb, status);
+    }
+    else{
+        pr_info("\n\n********** !!!!!!!!!  URB CANNOT BE SAFELY UNLINKED");
+        
+        print_urb(urb," ");
+        pr_info("\t\tUNLINK URB FROM EP: POSSIBLE PANIC FROM NOW ON if usb_hcd_unlink_urb_from_ep without sanitizing the urb or the hcd");
+        if(/*vurb->state == 3 && */urb->hcpriv == NULL){//has the urb been poisoned and the data transfer is complete?
+            print_state(vurb,q,urb,status,ret);
+            // struct urb *current_urb;
+            // struct list_head *i;
+            // int list_size=0;
+            // if (!list_empty(&urb->urb_list)) {
+            //     pr_info("here is ok 1 %p",&urb->urb_list);
+            //     struct list_head *pos = urb->urb_list.next;
+            //     pr_info("here is ok 2 %p",pos);
+            //     if(pos != NULL) {
+            //         while (pos != &urb->urb_list) {
+            //             pr_info("pos != &urb->urb_list");
+            //             if (pos->next == NULL) {
+            //                 pr_info("pos->next is NULL");
+            //                 break;
+            //             }
+            //             else 
+            //             {
+            //                 pr_info("pos->next is NOT NULL");
+            //             }
+            //             pos = pos->next;
+            //             pr_info("here is ok 3 %p",pos);
+            //             if(pos == NULL){
+            //                 pr_info("pos == NULL");
+            //                 break;
+            //             }
+            //             pr_info("going to increment the list");
+            //             list_size++;
+            //             pr_info("size is %d",list_size);
+            //         }
+            //     }
+            // } else {
+            //     printk(KERN_ERR "URB list is already empty or corrupted\n");
+            // }
+            // pr_info("list has %d elements",list_size);
+            // struct list_head *new_head = kmalloc(sizeof(struct list_head), GFP_KERNEL);
+            // if (new_head) {
+            //     INIT_LIST_HEAD(new_head);
+            // }
+            // urb->urb_list = *new_head;
+            //urb->status = -ESHUTDOWN;
+            // pr_info("URB urb->urb_list replaced by new_head field urb_list was not accessible and it was not possible to free it --- \tTRYING UNLINKING");
+            // usb_hcd_unlink_urb_from_ep(q->vhci->hcd, urb);
+            // vurb->state = BCE_VHCI_URB_INIT_PENDING;
 
-    usb_hcd_giveback_urb(q->vhci->hcd, urb, status);
+            // spin_unlock_irqrestore(&q->urb_lock, flags);
+            // bce_vhci_transfer_queue_remove_pending(q);
+            // if (q->sq_in)
+            //     bce_cmd_flush_memory_queue(q->vhci->dev->cmd_cmdq, (u16) q->sq_in->qid);
+            // bce_vhci_destroy_transfer_queue(q->vhci, q);
+            // skip_give_back = true;
+            q->active = false;
+            // struct bce_vhci_list_message *lm;
+            // if(list_empty(&q->evq))
+            //     pr_info("no q->evq to free");
 
+            // while (!list_empty(&q->evq)) {
+            //     lm = list_first_entry(&q->evq, struct bce_vhci_list_message, list);
+            //     list_del(&lm->list);
+            //     kfree(lm);
+            // }
+            spin_unlock_irqrestore(&q->urb_lock, flags);
+            // pr_info("check q->sq_in for flush");
+            // if (q->sq_in){
+            //     pr_info("going to flush q->sq_in");
+            //     bce_cmd_flush_memory_queue(q->vhci->dev->cmd_cmdq, (u16) q->sq_in->qid);
+            //     pr_info("flushed q->sq_in");
+            // }else{
+            //     pr_info("nothing to flush for q->sq_in");
+            // }
+                
+            // pr_info("check q->sq_out for flush");
+            // if (q->sq_out){
+            //     pr_info("going to flush q->sq_out");
+            //     bce_cmd_flush_memory_queue(q->vhci->dev->cmd_cmdq, (u16) q->sq_out->qid);
+            //     pr_info("flushed q->sq_out");
+            // }else{
+            //     pr_info("nothing to flush for q->sq_out");
+            // }
+
+            // pr_info("trying bce_vhci_cmd_port_power_off");
+            // bce_vhci_cmd_port_power_off(&q->vhci->cq, /*q->dev_addr, */(u8) (q->endp->desc.bEndpointAddress & 0x8F));
+            // pr_info("trying bce_vhci_cmd_port_power_on");
+            // bce_vhci_cmd_port_power_on(&q->vhci->cq, /*q->dev_addr, */(u8) (q->endp->desc.bEndpointAddress & 0x8F));
+            // pr_info("trying bce_vhci_cmd_endpoint_reset");
+            // int chkpoint = bce_vhci_cmd_endpoint_reset(&q->vhci->cq, q->dev_addr, (u8) (q->endp->desc.bEndpointAddress & 0x8F));
+            int chkpoint = 0;
+            spin_lock_irqsave(&q->urb_lock, flags);
+            //urb->status = -ESHUTDOWN;
+            allow_vurb_free = false;
+            pr_info("URB could have been POISONED --- \tAVOID UNLINKING %d, %s",chkpoint,get_error_name(chkpoint));
+        }else{
+            print_state(vurb,q,urb,status,ret);
+            pr_info("URB NOT POISONED --- \tTRYING UNLINKING");
+            usb_hcd_unlink_urb_from_ep(q->vhci->hcd, urb);
+        }
+         //urb->status = -ESHUTDOWN; //-ENODEV;//-ESHUTDOWN; // Reflect shutdown state
+        // urb->hcpriv = NULL;       // Clear host controller private data
+        // urb->transfer_flags = 0;  // Reset transfer flags
+        // urb->transfer_buffer_length = 0; // Reset transfer buffer length
+        // urb->actual_length = 0;   // Reset actual length
+        // urb->reject =0;
+        // Custom field to mark as pending init (if applicable)
+         //vurb->state = BCE_VHCI_URB_INIT_PENDING;
+        //pr_info("\t\ttrying usb_unpoison_urb");
+        // usb_unpoison_urb(urb);
+
+        // pr_info("\t\tincrementing urb before trying to unlink ");
+        // usb_get_urb(urb);
+        // pr_info("\t\ttrying to unlink ");
+        // spin_unlock_irqrestore(&q->urb_lock, flags);
+       
+        // //usb_unlink_urb(urb); 
+        // usb_kill_urb(urb);
+        // usb_fill_bulk_urb(urb, urb->dev, urb->pipe, urb->transfer_buffer, urb->transfer_buffer_length, urb->complete, urb->context);
+        // pr_info("bulk_urb_filled");
+        // int chkpoint = usb_submit_urb(urb, GFP_KERNEL);
+        // pr_info("chkpoint: %d",chkpoint);
+        //usb_hcd_unlink_urb_from_ep(q->vhci->hcd, urb);
+        // bce_vhci_urb_complete(vurb, -ESHUTDOWN);
+        
+        // spin_lock_irqsave(&q->urb_lock, flags);
+        
+        // pr_info("\t\tdecrementing urb after trying to unlink ");
+        // usb_put_urb(urb); 
+        // usb_hcd_flush_endpoint(urb->dev,urb->ep);
+        
+        // pr_info("\t\ttrying list_del_init");
+        // list_del_init(&urb->urb_list);
+        
+        // if(!skip_give_back){
+            spin_unlock_irqrestore(&q->urb_lock, flags);
+            bce_vhci_transfer_queue_giveback(q);
+        // }
+        
+        
+        //bce_vhci_urb_complete(vurb, 0);
+        // pr_info("going to check the status");
+        // bce_vhci_urb_control_check_status(vurb);
+
+        // pr_info("q->sq_in");
+        // dump_bce_queue_sq(q->sq_in);
+        // pr_info("q->sq_out");
+        // dump_bce_queue_sq(q->sq_out);
+        //bce_vhci_transfer_queue_deliver_pending(q);
+        // pr_info("checking q->sq_in");
+        // pr_info("q->sq_in: %p", q->sq_in);
+        // pr_info("checking q->sq_out");
+        // pr_info("q->sq_out: %p", q->sq_out);
+        //vurb->
+        // pr_info("trying bce_vhci_transfer_queue_completion");
+        
+        // bce_vhci_transfer_queue_completion(q->sq_in);
+
+        //pr_info("trying bce_notify_submission_complete");
+
+        //bce_notify_submission_complete(q->sq_in);
+        
+        
+        
+    }
+    
+    
+    
+    pr_info("SUCCESSSFULLY GIVEN BACK THE URB");
     if (vurb->state != BCE_VHCI_URB_INIT_PENDING)
         bce_vhci_transfer_queue_resume(q, BCE_VHCI_PAUSE_INTERNAL_WQ);
 
-    kfree(vurb);
+    if(allow_vurb_free)
+        kfree(vurb);
 
     return 0;
 }
