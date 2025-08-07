@@ -67,7 +67,13 @@ struct aaudio_stream {
     ktime_t remote_timestamp;
     snd_pcm_sframes_t frame_min;
     int started;
+
+    /* --- new for deferred handling --- */
+    struct work_struct       ts_work;      /* work item */
+    struct snd_pcm_substream *substream;   /* to call ALSA in work */
+    ktime_t                  ts_pending;   /* stash IRQ timestamp */
 };
+
 struct aaudio_subdevice {
     struct aaudio_device *a;
     struct list_head list;

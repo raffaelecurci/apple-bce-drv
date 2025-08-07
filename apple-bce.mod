@@ -1,0 +1,11 @@
+/home/fefe/Desktop/apple-bce-drv/apple_bce.o
+/home/fefe/Desktop/apple-bce-drv/mailbox.o
+/home/fefe/Desktop/apple-bce-drv/queue.o
+/home/fefe/Desktop/apple-bce-drv/queue_dma.o
+/home/fefe/Desktop/apple-bce-drv/vhci/vhci.o
+/home/fefe/Desktop/apple-bce-drv/vhci/queue.o
+/home/fefe/Desktop/apple-bce-drv/vhci/transfer.o
+/home/fefe/Desktop/apple-bce-drv/audio/audio.o
+/home/fefe/Desktop/apple-bce-drv/audio/protocol.o
+/home/fefe/Desktop/apple-bce-drv/audio/protocol_bce.o
+/home/fefe/Desktop/apple-bce-drv/audio/pcm.o

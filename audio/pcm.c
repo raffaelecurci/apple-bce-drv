@@ -107,16 +107,66 @@ static struct aaudio_stream *aaudio_pcm_stream(struct snd_pcm_substream *substre
         return &sdev->in_streams[substream->number];
 }
 
-static int aaudio_pcm_open(struct snd_pcm_substream *substream)
+/* static int aaudio_pcm_open(struct snd_pcm_substream *substream)
 {
     pr_debug("aaudio_pcm_open\n");
     substream->runtime->hw = *aaudio_pcm_stream(substream)->alsa_hw_desc;
 
     return 0;
+} */
+
+/* 1. Deferred work callback: runs in safe process context */
+static void aaudio_ts_work_fn(struct work_struct *work)
+{
+    struct aaudio_stream *stream =
+        container_of(work, struct aaudio_stream, ts_work);
+    struct snd_pcm_substream *sub = stream->substream;
+    unsigned long flags;
+    ktime_t ts = stream->ts_pending;
+
+    /* replicate original lock/update/period logic under proper context */
+    snd_pcm_stream_lock_irqsave(sub, flags);
+    stream->remote_timestamp = ts;
+    if (stream->waiting_for_first_ts) {
+        stream->waiting_for_first_ts = false;
+        snd_pcm_stream_unlock_irqrestore(sub, flags);
+        return;
+    }
+    snd_pcm_stream_unlock_irqrestore(sub, flags);
+
+    snd_pcm_period_elapsed(sub);
 }
 
+/* 3. PCM open: set runtime HW and initialize the work item */
+static int aaudio_pcm_open(struct snd_pcm_substream *substream)
+{
+    struct aaudio_stream *stream = aaudio_pcm_stream(substream);
+
+    pr_debug("aaudio_pcm_open\n");
+    substream->runtime->hw = *stream->alsa_hw_desc;
+
+    /* bind substream for deferred callback and init work_struct */
+    stream->substream = substream;
+    INIT_WORK(&stream->ts_work, aaudio_ts_work_fn);
+
+    return 0;
+}
+
+
+/* static int aaudio_pcm_close(struct snd_pcm_substream *substream)
+{
+    pr_debug("aaudio_pcm_close\n");
+    return 0;
+}*/
+
+/* 4. PCM close: cancel any pending deferred work */
 static int aaudio_pcm_close(struct snd_pcm_substream *substream)
 {
+    struct aaudio_stream *stream = aaudio_pcm_stream(substream);
+
+    /* ensure ts_work won’t run after we tear down the stream */
+    cancel_work_sync(&stream->ts_work);
+
     pr_debug("aaudio_pcm_close\n");
     return 0;
 }
@@ -278,7 +328,7 @@ int aaudio_create_pcm(struct aaudio_subdevice *sdev)
     return 0;
 }
 
-static void aaudio_handle_stream_timestamp(struct snd_pcm_substream *substream, ktime_t timestamp)
+/*static void aaudio_handle_stream_timestamp(struct snd_pcm_substream *substream, ktime_t timestamp)
 {
     unsigned long flags;
     struct aaudio_stream *stream;
@@ -293,7 +343,21 @@ static void aaudio_handle_stream_timestamp(struct snd_pcm_substream *substream, 
     }
     snd_pcm_stream_unlock_irqrestore(substream, flags);
     snd_pcm_period_elapsed(substream);
+}*/
+
+/* 2. IRQ‐time stub: stash params and defer all handling */
+static void aaudio_handle_stream_timestamp(struct snd_pcm_substream *substream,
+    ktime_t timestamp)
+{
+    struct aaudio_stream *stream = aaudio_pcm_stream(substream);
+
+    /* stash IRQ‐safe copy of the timestamp */
+    stream->ts_pending = timestamp;
+
+    /* queue the entire old handler logic for process‐context execution */
+    schedule_work(&stream->ts_work);
 }
+
 
 void aaudio_handle_timestamp(struct aaudio_subdevice *sdev, ktime_t os_timestamp, u64 dev_timestamp)
 {
