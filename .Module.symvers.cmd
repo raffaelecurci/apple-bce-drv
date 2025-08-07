@@ -1,1 +1,0 @@
-savedcmd_/home/fefe/Desktop/apple-bce-drv/Module.symvers :=  scripts/mod/modpost -M -m -a      -o /home/fefe/Desktop/apple-bce-drv/Module.symvers -T /home/fefe/Desktop/apple-bce-drv/modules.order -i Module.symvers -e 
