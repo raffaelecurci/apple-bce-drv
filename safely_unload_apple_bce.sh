@@ -10,12 +10,16 @@ fi
 
 echo "Stopping PipeWire services..."
 systemctl --user stop pipewire.service pipewire.socket
+#sudo systemctl stop pipewire.service pipewire.socket
+
 
 echo "Stopping PulseAudio services..."
 systemctl --user stop pulseaudio.service pulseaudio.socket
+#sudo systemctl stop pulseaudio.service pulseaudio.socket
 
 echo "Stopping WirePlumber service..."
 systemctl --user stop wireplumber.service
+#sudo systemctl stop wireplumber.service
 
 echo "All specified services have been stopped."
 

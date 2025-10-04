@@ -53,6 +53,7 @@ struct aaudio_dma_buf {
     void *ptr;
     size_t size;
 };
+
 struct aaudio_stream {
     aaudio_object_id_t id;
     size_t buffer_cnt;
@@ -72,6 +73,9 @@ struct aaudio_stream {
     struct work_struct       ts_work;      /* work item */
     struct snd_pcm_substream *substream;   /* to call ALSA in work */
     ktime_t                  ts_pending;   /* stash IRQ timestamp */
+
+    spinlock_t lock;     // For atomic sections (e.g. pcm_pointer)
+    struct mutex mmap_lock; // For mmap, open, close, buffer setup
 };
 
 struct aaudio_subdevice {

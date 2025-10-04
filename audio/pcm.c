@@ -1,5 +1,9 @@
+#include <sound/core.h>
 #include "pcm.h"
 #include "audio.h"
+#include <linux/mm.h>      // remap_pfn_range
+#include <linux/err.h>     // error codes
+#include <linux/device.h>  // dev_dbg, dev_err
 
 static u64 aaudio_get_alsa_fmtbit(struct aaudio_apple_description *desc)
 {
@@ -70,6 +74,7 @@ int aaudio_create_hw_info(struct aaudio_apple_description *desc, struct snd_pcm_
         size_t buf_size)
 {
     uint rate;
+    buf_size = PAGE_ALIGN(buf_size);
     alsa_hw->info = (SNDRV_PCM_INFO_MMAP |
                      SNDRV_PCM_INFO_BLOCK_TRANSFER |
                      SNDRV_PCM_INFO_MMAP_VALID |
@@ -148,6 +153,9 @@ static int aaudio_pcm_open(struct snd_pcm_substream *substream)
     /* bind substream for deferred callback and init work_struct */
     stream->substream = substream;
     INIT_WORK(&stream->ts_work, aaudio_ts_work_fn);
+    
+    spin_lock_init(&stream->lock);
+    mutex_init(&stream->mmap_lock);
 
     return 0;
 }
@@ -212,6 +220,7 @@ static void aaudio_pcm_start(struct snd_pcm_substream *substream)
         s = frames_to_bytes(substream->runtime, substream->runtime->control->appl_ptr);
         buf = kmalloc(s, GFP_KERNEL);
         memcpy_fromio(buf, substream->runtime->dma_area, s);
+//	memcpy(buf, substream->runtime->dma_area, s);
         time_end = ktime_get();
         pr_debug("aaudio: Backed up the buffer in %lluns [%li]\n", ktime_to_ns(time_end - time_start),
                 substream->runtime->control->appl_ptr);
@@ -223,6 +232,8 @@ static void aaudio_pcm_start(struct snd_pcm_substream *substream)
     aaudio_cmd_start_io(sdev->a, sdev->dev_id);
     if (back_buffer)
         memcpy_toio(substream->runtime->dma_area, buf, s);
+        kfree(buf);
+//	memcpy(substream->runtime->dma_area, buf, s);
 
     time_end = ktime_get();
     pr_debug("aaudio: Started the audio device in %lluns\n", ktime_to_ns(time_end - time_start));
@@ -252,6 +263,8 @@ static int aaudio_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
     return 0;
 }
 
+
+/*
 static snd_pcm_uframes_t aaudio_pcm_pointer(struct snd_pcm_substream *substream)
 {
     struct aaudio_stream *stream = aaudio_pcm_stream(substream);
@@ -264,8 +277,9 @@ static snd_pcm_uframes_t aaudio_pcm_pointer(struct snd_pcm_substream *substream)
         return 0;
     }
 
-    /* Approximate the pointer based on the last received timestamp */
+    // Approximate the pointer based on the last received timestamp 
     time_from_start = ktime_get_boottime() - stream->remote_timestamp;
+
     buffer_time_length = NSEC_PER_SEC * substream->runtime->buffer_size / substream->runtime->rate;
     frames = (ktime_to_ns(time_from_start) % buffer_time_length) * substream->runtime->buffer_size / buffer_time_length;
     if (ktime_to_ns(time_from_start) < buffer_time_length) {
@@ -277,24 +291,199 @@ static snd_pcm_uframes_t aaudio_pcm_pointer(struct snd_pcm_substream *substream)
         if (ktime_to_ns(time_from_start) < 2 * buffer_time_length)
             stream->frame_min = frames;
         else
-            stream->frame_min = 0; /* Heavy desync */
+            stream->frame_min = 0; // Heavy desync
     }
     frames -= stream->latency;
     if (frames < 0)
         frames += ((-frames - 1) / substream->runtime->buffer_size + 1) * substream->runtime->buffer_size;
     return (snd_pcm_uframes_t) frames;
+} */
+
+static snd_pcm_uframes_t aaudio_pcm_pointer(struct snd_pcm_substream *substream)
+{
+    struct aaudio_stream *stream = aaudio_pcm_stream(substream);
+    ktime_t time_from_start;
+    snd_pcm_sframes_t frames;
+    snd_pcm_sframes_t buffer_time_length;
+    unsigned long flags;
+
+    // 🔐 TODO: Add spinlock or mutex if this function is called concurrently
+    spin_lock_irqsave(&stream->lock, flags);
+
+    if (!stream->started || stream->waiting_for_first_ts) {
+        pr_debug_once("aaudio_pcm_pointer called before stream started or first timestamp received\n");
+        spin_unlock_irqrestore(&stream->lock, flags);
+        return 0;
+    }
+
+    if (substream->runtime->rate == 0 || substream->runtime->buffer_size == 0) {
+        pr_err("aaudio_pcm_pointer: invalid runtime config: rate=%u buffer_size=%lu\n",
+               substream->runtime->rate, substream->runtime->buffer_size);
+        spin_unlock_irqrestore(&stream->lock, flags);
+        return 0;
+    }
+
+    // Ensure remote_timestamp was initialized
+    if (stream->remote_timestamp == 0) {
+        pr_warn_once("aaudio_pcm_pointer: remote_timestamp not initialized\n");
+        spin_unlock_irqrestore(&stream->lock, flags);
+        return 0;
+    }
+
+    time_from_start = ktime_get_boottime() - stream->remote_timestamp;
+
+    buffer_time_length = NSEC_PER_SEC *
+                         substream->runtime->buffer_size /
+                         substream->runtime->rate;
+
+    if (buffer_time_length == 0) {
+        pr_err("aaudio_pcm_pointer: buffer_time_length is 0, possible bad config\n");
+        spin_unlock_irqrestore(&stream->lock, flags);
+        return 0;
+    }
+
+    frames = (ktime_to_ns(time_from_start) % buffer_time_length) *
+             substream->runtime->buffer_size / buffer_time_length;
+
+    if (ktime_to_ns(time_from_start) < buffer_time_length) {
+        if (frames < stream->frame_min)
+            frames = stream->frame_min;
+        else
+            stream->frame_min = 0;
+    } else {
+        if (ktime_to_ns(time_from_start) < 2 * buffer_time_length)
+            stream->frame_min = frames;
+        else
+            stream->frame_min = 0; // Heavy desync
+    }
+
+    frames -= stream->latency;
+
+    if (frames < 0) {
+        frames += ((-frames - 1) / substream->runtime->buffer_size + 1) *
+                  substream->runtime->buffer_size;
+    }
+
+    spin_unlock_irqrestore(&stream->lock, flags);
+    return (snd_pcm_uframes_t)frames;
 }
 
+static int aaudio_pcm_mmap(struct snd_pcm_substream *substream,
+    struct vm_area_struct *vma)
+{
+    struct snd_pcm_runtime *runtime = substream->runtime;
+    size_t size = vma->vm_end - vma->vm_start;
+    struct aaudio_stream *stream = aaudio_pcm_stream(substream);
+    struct device *dev = substream->pcm->card->dev;
+
+    mutex_lock(&stream->mmap_lock);
+
+    if (!runtime || !runtime->dma_area || !runtime->dma_bytes || !runtime->dma_addr) {
+        dev_err(dev,
+        "mmap: invalid DMA state: runtime=%p, dma_area=%p, dma_bytes=%zu, dma_addr=0x%llx\n",
+        runtime,
+        runtime ? runtime->dma_area : NULL,
+        runtime ? runtime->dma_bytes : 0,
+        (unsigned long long)(runtime ? runtime->dma_addr : 0));
+        mutex_unlock(&stream->mmap_lock);
+        return -EINVAL;
+    }
+
+    if (runtime->dma_addr & ~PAGE_MASK) {
+        dev_err(dev, "mmap: dma_addr is not page-aligned: 0x%llx\n",
+        (unsigned long long)runtime->dma_addr);
+        mutex_unlock(&stream->mmap_lock);
+        return -EINVAL;
+    }
+
+    // Defensive guard (even if dma_bytes is aligned)
+    size_t dma_bytes_rounded = PAGE_ALIGN(runtime->dma_bytes);
+    if (size > dma_bytes_rounded) {
+        dev_err(dev,
+        "mmap: requested size %zu exceeds aligned DMA buffer size %zu (raw: %zu)\n",
+        size, dma_bytes_rounded, runtime->dma_bytes);
+        mutex_unlock(&stream->mmap_lock);
+        return -EINVAL;
+    }
+
+    dev_dbg(dev,
+    "mmap: vm_start=0x%lx vm_end=0x%lx dma_addr=0x%llx size=%zu\n",
+    vma->vm_start, vma->vm_end,
+    (unsigned long long)runtime->dma_addr,
+    runtime->dma_bytes);
+
+    vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
+
+    unsigned long pfn = runtime->dma_addr >> PAGE_SHIFT;
+    if (remap_pfn_range(vma, vma->vm_start, pfn, size, vma->vm_page_prot)) {
+        dev_err(dev, "mmap: remap_pfn_range failed (size=%zu, pfn=0x%lx)\n", size, pfn);
+        mutex_unlock(&stream->mmap_lock);
+        return -EFAULT;
+    }
+
+    mutex_unlock(&stream->mmap_lock);
+    return 0;
+}
+
+
+
+/*
+Fix mmap function in audio driver to add bounds checking and improve error handling
+
+- Added size check to ensure requested mmap area does not exceed DMA buffer size
+- Return -EINVAL if mmap size is too large to prevent invalid memory access
+- Change error code on remap_pfn_range failure to -EFAULT for accuracy
+- Added dev_err logging on error cases for easier debugging
+- Retained pgprot_noncached to avoid PAT warnings on x86
+
+Improves robustness and stability of DMA buffer mmap in snd_pcm_ops.
+*/
+/*static int aaudio_pcm_mmap(struct snd_pcm_substream *substream,
+                           struct vm_area_struct *vma)
+{
+    struct snd_pcm_runtime *runtime = substream->runtime;
+    size_t size = vma->vm_end - vma->vm_start;
+
+    // Verifica dimensione richiesta non superi il buffer DMA
+    if (size > runtime->dma_bytes) {
+        dev_err(substream->pcm->card->dev,
+                "mmap: requested size %zu exceeds buffer size %zu\n",
+                size, runtime->dma_bytes);
+        return -EINVAL;
+    }
+
+    dev_dbg(substream->pcm->card->dev,
+            "mmap: vm_start=0x%lx vm_end=0x%lx dma_addr=0x%llx size=%zu\n",
+            vma->vm_start, vma->vm_end,
+            (unsigned long long)runtime->dma_addr,
+            runtime->dma_bytes);
+
+    // Imposta mappatura non cached per evitare problemi PAT
+    vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
+
+    // Calcola pfn fisico del buffer DMA
+    unsigned long pfn = runtime->dma_addr >> PAGE_SHIFT;
+
+    // Effettua il mapping: se fallisce ritorna errore appropriato
+    if (remap_pfn_range(vma, vma->vm_start, pfn, size, vma->vm_page_prot)) {
+        dev_err(substream->pcm->card->dev, "mmap: remap_pfn_range failed\n");
+        return -EFAULT;
+    }
+
+    return 0;
+}*/
+
 static struct snd_pcm_ops aaudio_pcm_ops = {
-        .open =        aaudio_pcm_open,
-        .close =       aaudio_pcm_close,
-        .ioctl =       snd_pcm_lib_ioctl,
-        .hw_params =   aaudio_pcm_hw_params,
-        .hw_free =     aaudio_pcm_hw_free,
-        .prepare =     aaudio_pcm_prepare,
-        .trigger =     aaudio_pcm_trigger,
-        .pointer =     aaudio_pcm_pointer,
-        .mmap    =     snd_pcm_lib_mmap_iomem
+        .open       =   aaudio_pcm_open,
+        .close      =   aaudio_pcm_close,
+        .ioctl      =   snd_pcm_lib_ioctl,
+        .hw_params  =   aaudio_pcm_hw_params,
+        .hw_free    =   aaudio_pcm_hw_free,
+        .prepare    =   aaudio_pcm_prepare,
+        .trigger    =   aaudio_pcm_trigger,
+        .pointer    =   aaudio_pcm_pointer,
+        //.mmap       =   snd_pcm_lib_mmap_iomem
+    	.mmap       =   aaudio_pcm_mmap
 };
 
 int aaudio_create_pcm(struct aaudio_subdevice *sdev)
